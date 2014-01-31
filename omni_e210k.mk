@@ -24,7 +24,7 @@ $(call inherit-product, vendor/omni/config/common.mk)
 
 # This is where we'd set a backup provider if we had one
 #$(call inherit-product, device/sample/products/backup_overlay.mk)
-$(call inherit-product, device/samsung/e210k/device.mk)
+$(call inherit-product, device/samsung/e210k/full_e210k.mk)
 
 # Discard inherited values and use our own instead.
 PRODUCT_NAME := omni_e210k
@@ -32,3 +32,7 @@ PRODUCT_DEVICE := e210k
 PRODUCT_BRAND := samsung
 PRODUCT_MANUFACTURER := Samsung
 PRODUCT_MODEL := SHV-E210K
+
+# Boot animation
+TARGET_SCREEN_HEIGHT := 1280
+TARGET_SCREEN_WIDTH := 720

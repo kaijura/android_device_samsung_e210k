@@ -18,14 +18,18 @@
 # by BoardConfigVendor.mk
 
 -include device/samsung/smdk4412-common/BoardCommonConfig.mk
+-include device/samsung/smdk4412-qcom-common/BoardCommonConfig.mk
 
-# RIL
-BOARD_PROVIDES_LIBRIL := true
-BOARD_MODEM_TYPE := xmm6262
-TARGET_SPECIFIC_HEADER_PATH := device/samsung/e210k/include
+LOCAL_PATH := device/samsung/e210k
 
 # Bluetooth
 BOARD_BLUETOOTH_BDROID_BUILDCFG_INCLUDE_DIR := device/samsung/e210k/bluetooth
+
+# RIL
+COMMON_GLOBAL_CFLAGS += -DPROPERTY_PERMS_APPEND='{ "ril.ks.status", AID_SYSTEM, 0 },'
+
+# Camera
+COMMON_GLOBAL_CFLAGS += -DCAMERA_WITH_CITYID_PARA
 
 # Kernel
 TARGET_KERNEL_SOURCE := kernel/samsung/smdk4412
@@ -35,27 +39,36 @@ TARGET_KERNEL_CONFIG := custom_i9300_defconfig
 TARGET_RECOVERY_FSTAB := device/samsung/e210k/rootdir/fstab.smdk4x12
 RECOVERY_FSTAB_VERSION := 2
 
-# Selinux
-BOARD_SEPOLICY_DIRS += \
-    device/samsung/e210k/selinux
-
-BOARD_SEPOLICY_UNION += \
-    device.te \
-    domain.te \
-    file.te \
-    file_contexts \
-    init.te \
-    mediaserver.te \
-    rild.te \
-    system.te \
-    ueventd.te \
-    wpa_supplicant.te
-
 # assert
 TARGET_OTA_ASSERT_DEVICE := m0,i9300,GT-I9300
 
 # inherit from the proprietary version
 -include vendor/samsung/e210k/BoardConfigVendor.mk
 
+# Selinux
+BOARD_SEPOLICY_DIRS += \
+    device/samsung/e210k/selinux
+
+BOARD_SEPOLICY_UNION += \
+ file_contexts \
+    te_macros \
+    device.te \
+    dhcp.te \
+    domain.te \
+    file.te \
+    init.te \
+    kickstart.te \
+    mediaserver.te \
+    netmgrd.te \
+    qmux.te \
+    rild.te \
+    secril.te \
+    system.te \
+    ueventd.te \
+    wpa_supplicant.te
+
 # TWRP
 DEVICE_RESOLUTION := 720x1280
+
+# Compatibility with pre-kitkat Sensor HALs
+SENSORS_NEED_SETRATE_ON_ENABLE := true

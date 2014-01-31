@@ -27,6 +27,7 @@
 #include <sys/time.h>
 #include <stdlib.h>
 #include <expat.h>
+#include <dlfcn.h>
 
 #include <cutils/log.h>
 #include <cutils/str_parms.h>
@@ -43,7 +44,6 @@
 #include <audio_effects/effect_aec.h>
 
 #include "audio_hw.h"
-#include "ril_interface.h"
 
 struct pcm_config pcm_config_mm = {
     .channels = 2,
@@ -73,7 +73,7 @@ struct pcm_config pcm_config_capture = {
 
 struct pcm_config pcm_config_vx = {
     .channels = 2,
-    .rate = VX_NB_SAMPLING_RATE,
+    .rate = VX_WB_SAMPLING_RATE,
     .period_size = 160,
     .period_count = 2,
     .format = PCM_FORMAT_S16_LE,
@@ -96,6 +96,8 @@ struct m0_audio_device {
     int in_device;
     struct pcm *pcm_modem_dl;
     struct pcm *pcm_modem_ul;
+    struct pcm *pcm_bt_dl;
+    struct pcm *pcm_bt_ul;
     int in_call;
     float voice_volume;
     struct m0_stream_in *active_input;
@@ -104,11 +106,7 @@ struct m0_audio_device {
     int tty_mode;
     struct echo_reference_itfe *echo_reference;
     bool bluetooth_nrec;
-    int wb_amr;
     bool screen_off;
-
-    /* RIL */
-    struct ril_handle ril;
 };
 
 struct m0_stream_out {
@@ -193,6 +191,62 @@ struct m0_dev_cfg {
     unsigned int off_len;
 };
 
+/* QCOM CSD-Client */
+#define CSD_CLIENT_LIBPATH "/system/lib/libcsd-client.so"
+
+void *mCsdHandle;
+int rx_dev_id, tx_dev_id, old_rx_dev;
+int voice_index;
+
+static int (*csd_client_init)();
+static int (*csd_client_deinit)();
+static int (*csd_start_playback)();
+static int (*csd_stop_playback)();
+static int (*csd_disable_device)();
+static int (*csd_enable_device)(int, int, uint32_t);
+static int (*csd_switch_device)(int,int);
+static int (*csd_volume)(int);
+static int (*csd_mic_mute)(int);
+static int (*csd_wide_voice)(uint8_t);
+static int (*csd_slow_talk)(uint8_t);
+static int (*csd_fens)(uint8_t);
+static int (*csd_volume_index)(int);
+static int (*csd_start_voice)(int,int,int);
+static int (*csd_stop_voice)(int);
+static int (*csd_client_volume)(int);
+static int (*csd_client_mic_mute)(int);
+static int (*csd_client_pcm_loopback_start)(int,int);
+static int (*csd_client_pcm_loopback_stop)(int);
+
+void setCsdHandle(void* handle)
+{
+    void *mcsd_handle;
+    mcsd_handle = (void*)handle;
+    ALOGD("%s csd_handle: %p", __func__, mcsd_handle);
+
+    csd_start_voice = (int (*)(int,int,int)) dlsym(mcsd_handle,"csd_client_start_voice");
+    csd_enable_device = (int (*)(int,int,uint32_t)) dlsym(mcsd_handle,"csd_client_enable_device");
+    csd_disable_device = (int (*)()) dlsym(mcsd_handle,"csd_client_disable_device");
+    //csd_client_start_record
+    //csd_client_stop_record
+    csd_start_playback = (int (*)()) dlsym(mcsd_handle,"csd_client_start_playback");
+    csd_stop_playback = (int (*)()) dlsym(mcsd_handle,"csd_client_stop_playback");
+    csd_volume = (int (*)(int)) dlsym(mcsd_handle,"csd_client_volume");
+    csd_mic_mute = (int (*)(int)) dlsym(mcsd_handle,"csd_client_mic_mute");
+    csd_wide_voice = (int (*)(uint8_t)) dlsym(mcsd_handle,"csd_client_wide_voice");
+    csd_slow_talk = (int (*)(uint8_t)) dlsym(mcsd_handle,"csd_client_slow_talk");
+    csd_fens = (int (*)(uint8_t)) dlsym(mcsd_handle,"csd_client_fens");
+    csd_volume_index = (int (*)(int)) dlsym(mcsd_handle,"csd_client_volume_index");
+    csd_switch_device = (int (*)(int,int)) dlsym(mcsd_handle,"csd_client_switch_device");
+    //csd_client_stream_mute
+    csd_client_pcm_loopback_start = (int (*)(int,int)) dlsym(mcsd_handle,"csd_client_pcm_loopback_start");
+    csd_client_pcm_loopback_stop = (int (*)(int)) dlsym(mcsd_handle,"csd_client_pcm_loopback_stop");
+    //csd_client_tty
+    csd_client_init = (int (*)()) dlsym(mcsd_handle,"csd_client_init_lb");
+    csd_client_deinit = (int (*)()) dlsym(mcsd_handle,"csd_client_deinit_lb");
+    csd_stop_voice = (int (*)(int)) dlsym(mcsd_handle,"csd_client_stop_voice");
+}
+
 /**
  * NOTE: when multiple mutexes have to be acquired, always respect the following order:
  *        hw device > in stream > out stream
@@ -207,7 +261,7 @@ static void in_update_aux_channels(struct m0_stream_in *in, effect_handle_t effe
 
 /* The enable flag when 0 makes the assumption that enums are disabled by
  * "Off" and integers/booleans by 0 */
-static int set_voicecall_route_by_array(struct mixer *mixer, struct route_setting *route,
+static int set_bigroute_by_array(struct mixer *mixer, struct route_setting *route,
                               int enable)
 {
     struct mixer_ctl *ctl;
@@ -351,17 +405,22 @@ void select_devices(struct m0_audio_device *adev)
 
 static int start_call(struct m0_audio_device *adev)
 {
-    ALOGE("Opening modem PCMs");
+    ALOGV("Opening modem PCMs");
     int bt_on;
 
     bt_on = adev->out_device & AUDIO_DEVICE_OUT_ALL_SCO;
-    pcm_config_vx.rate = adev->wb_amr ? VX_WB_SAMPLING_RATE : VX_NB_SAMPLING_RATE;
+
+    if(bt_on){
+       /* use amr-nb for bluetooth */
+       pcm_config_vx.rate = VX_NB_SAMPLING_RATE;
+    }else{
+       /* use amr-wb by default */
+       pcm_config_vx.rate = VX_WB_SAMPLING_RATE;
+    }
 
     /* Open modem PCM channels */
     if (adev->pcm_modem_dl == NULL) {
-        if (bt_on)
-            adev->pcm_modem_dl = pcm_open(CARD_DEFAULT, PORT_BT, PCM_OUT, &pcm_config_vx);
-        else
+        ALOGD("Opening PCM modem DL stream");
             adev->pcm_modem_dl = pcm_open(CARD_DEFAULT, PORT_MODEM, PCM_OUT, &pcm_config_vx);
         if (!pcm_is_ready(adev->pcm_modem_dl)) {
             ALOGE("cannot open PCM modem DL stream: %s", pcm_get_error(adev->pcm_modem_dl));
@@ -370,6 +429,7 @@ static int start_call(struct m0_audio_device *adev)
     }
 
     if (adev->pcm_modem_ul == NULL) {
+        ALOGD("Opening PCM modem UL stream");
         adev->pcm_modem_ul = pcm_open(CARD_DEFAULT, PORT_MODEM, PCM_IN, &pcm_config_vx);
         if (!pcm_is_ready(adev->pcm_modem_ul)) {
             ALOGE("cannot open PCM modem UL stream: %s", pcm_get_error(adev->pcm_modem_ul));
@@ -377,95 +437,172 @@ static int start_call(struct m0_audio_device *adev)
         }
     }
 
+    ALOGD("Starting PCM modem streams");
     pcm_start(adev->pcm_modem_dl);
     pcm_start(adev->pcm_modem_ul);
+
+    /* Open bluetooth PCM channels */
+    if (bt_on) {
+        ALOGV("Opening bluetooth PCMs");
+        if (adev->pcm_bt_dl == NULL) {
+            ALOGD("Opening PCM bluetooth DL stream");
+            adev->pcm_bt_dl = pcm_open(CARD_DEFAULT, PORT_BT, PCM_OUT, &pcm_config_vx);
+            if (!pcm_is_ready(adev->pcm_bt_dl)) {
+                ALOGE("cannot open PCM bluetooth DL stream: %s", pcm_get_error(adev->pcm_bt_dl));
+                goto err_open_dl;
+            }
+        }
+
+        if (adev->pcm_bt_ul == NULL) {
+            ALOGD("Opening PCM bluetooth UL stream");
+            adev->pcm_bt_ul = pcm_open(CARD_DEFAULT, PORT_BT, PCM_IN, &pcm_config_vx);
+            if (!pcm_is_ready(adev->pcm_bt_ul)) {
+                ALOGE("cannot open PCM bluetooth UL stream: %s", pcm_get_error(adev->pcm_bt_ul));
+                goto err_open_ul;
+            }
+        }
+        ALOGD("Starting PCM bluetooth streams");
+        pcm_start(adev->pcm_bt_dl);
+        pcm_start(adev->pcm_bt_ul);
+    }
 
     return 0;
 
 err_open_ul:
     pcm_close(adev->pcm_modem_ul);
     adev->pcm_modem_ul = NULL;
+    pcm_close(adev->pcm_bt_ul);
+    adev->pcm_bt_ul = NULL;
 err_open_dl:
     pcm_close(adev->pcm_modem_dl);
     adev->pcm_modem_dl = NULL;
+    pcm_close(adev->pcm_bt_dl);
+    adev->pcm_bt_dl = NULL;
 
     return -ENOMEM;
 }
 
 static void end_call(struct m0_audio_device *adev)
 {
-    ALOGE("Closing modem PCMs");
-    pcm_stop(adev->pcm_modem_dl);
-    pcm_stop(adev->pcm_modem_ul);
-    pcm_close(adev->pcm_modem_dl);
-    pcm_close(adev->pcm_modem_ul);
+    int bt_on;
+    bt_on = adev->out_device & AUDIO_DEVICE_OUT_ALL_SCO;
+
+    if (adev->pcm_modem_dl != NULL) {
+        ALOGD("Stopping modem DL PCM");
+        pcm_stop(adev->pcm_modem_dl);
+        ALOGV("Closing modem DL PCM");
+        pcm_close(adev->pcm_modem_dl);
+    }
+    if (adev->pcm_modem_ul != NULL) {
+        ALOGD("Stopping modem UL PCM");
+        pcm_stop(adev->pcm_modem_ul);
+        ALOGV("Closing modem UL PCM");
+        pcm_close(adev->pcm_modem_ul);
+    }
     adev->pcm_modem_dl = NULL;
     adev->pcm_modem_ul = NULL;
 
-    /* re-enable +30db boost on mics */
-    mixer_ctl_set_value(adev->mixer_ctls.mixinl_in1l_volume, 0, 1);
-    mixer_ctl_set_value(adev->mixer_ctls.mixinl_in2l_volume, 0, 1);
+    if (bt_on || old_rx_dev == DEVICE_BT_SCO_RX_ACDB_ID) {
+        if (adev->pcm_bt_dl != NULL) {
+            ALOGD("Stopping bluetooth DL PCM");
+            pcm_stop(adev->pcm_bt_dl);
+            ALOGV("Closing bluetooth DL PCM");
+            pcm_close(adev->pcm_bt_dl);
+        }
+        if (adev->pcm_bt_ul != NULL) {
+            ALOGD("Stopping bluetooth UL PCM");
+            pcm_stop(adev->pcm_bt_ul);
+            ALOGV("Closing bluetooth UL PCM");
+            pcm_close(adev->pcm_bt_ul);
+        }
+    }
+    adev->pcm_bt_dl = NULL;
+    adev->pcm_bt_ul = NULL;
 }
 
 static void set_eq_filter(struct m0_audio_device *adev)
 {
 }
 
-void audio_set_wb_amr_callback(void *data, int enable)
-{
-    struct m0_audio_device *adev = (struct m0_audio_device *)data;
-
-    pthread_mutex_lock(&adev->lock);
-    if (adev->wb_amr != enable) {
-        adev->wb_amr = enable;
-
-        /* reopen the modem PCMs at the new rate */
-        if (adev->in_call) {
-            end_call(adev);
-            select_output_device(adev);
-            start_call(adev);
-        }
-    }
-    pthread_mutex_unlock(&adev->lock);
-}
-
 static void set_incall_device(struct m0_audio_device *adev)
 {
-    int device_type;
+    int err;
+    uint32_t mDevSettingsFlag = TTY_OFF;
 
     switch(adev->out_device) {
         case AUDIO_DEVICE_OUT_EARPIECE:
-            device_type = SOUND_AUDIO_PATH_HANDSET;
+            rx_dev_id = DEVICE_HANDSET_RX_ACDB_ID;
+            tx_dev_id = DEVICE_HANDSET_TX_ACDB_ID;
+            voice_index = 5;
             break;
         case AUDIO_DEVICE_OUT_SPEAKER:
-        case AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET: 
+        case AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET:
         case AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET:
         case AUDIO_DEVICE_OUT_AUX_DIGITAL:
-            device_type = SOUND_AUDIO_PATH_SPEAKER;
+            rx_dev_id = DEVICE_SPEAKER_MONO_RX_ACDB_ID;
+            tx_dev_id = DEVICE_HANDSET_TX_ACDB_ID;
+            voice_index = 9;
             break;
         case AUDIO_DEVICE_OUT_WIRED_HEADSET:
-            device_type = SOUND_AUDIO_PATH_HEADSET;
-            break;
         case AUDIO_DEVICE_OUT_WIRED_HEADPHONE:
-            device_type = SOUND_AUDIO_PATH_HEADPHONE;
+            rx_dev_id = DEVICE_HEADSET_RX_ACDB_ID;
+            tx_dev_id = DEVICE_HEADSET_TX_ACDB_ID;
+            voice_index = 5;
             break;
         case AUDIO_DEVICE_OUT_BLUETOOTH_SCO:
         case AUDIO_DEVICE_OUT_BLUETOOTH_SCO_HEADSET:
         case AUDIO_DEVICE_OUT_BLUETOOTH_SCO_CARKIT:
             if (adev->bluetooth_nrec) {
-                device_type = SOUND_AUDIO_PATH_BLUETOOTH;
+                rx_dev_id = DEVICE_BT_SCO_RX_ACDB_ID;
+                tx_dev_id = DEVICE_BT_SCO_TX_ACDB_ID;
             } else {
-                device_type = SOUND_AUDIO_PATH_BLUETOOTH_NO_NR;
+                rx_dev_id = DEVICE_BT_SCO_RX_ACDB_ID;
+                tx_dev_id = DEVICE_BT_SCO_TX_ACDB_ID;
             }
+            voice_index = 7;
             break;
         default:
-            device_type = SOUND_AUDIO_PATH_HANDSET;
+            rx_dev_id = DEVICE_HANDSET_RX_ACDB_ID;
+            tx_dev_id = DEVICE_HANDSET_TX_ACDB_ID;
+            voice_index = 5;
             break;
     }
 
-    /* if output device isn't supported, open modem side to handset by default */
-    ALOGE("%s: ril_set_call_audio_path(%d)", __func__, device_type);
-    ril_set_call_audio_path(&adev->ril, device_type);
+    ALOGV("rx_dev_id=%d, tx_dev_id=%d\n", rx_dev_id, tx_dev_id);
+
+    /* QCOM CSD-CLIENT */
+    if (!adev->in_call) {
+        if (csd_start_voice == NULL) {
+            ALOGE("dlsym:Error:%s Loading csd_client_start_voice", dlerror());
+        } else {
+            ALOGD("%s: calling csd_start_voice", __func__);
+            err = csd_start_voice(rx_dev_id, tx_dev_id, 1);
+            if (err < 0) {
+                ALOGE("%s: csd_start_voice error %d\n", __func__, err);
+            }
+        }
+    }
+
+    if (csd_switch_device == NULL) {
+        ALOGE("dlsym:Error:%s Loading csd_client_switch_device", dlerror());
+    } else {
+        ALOGD("%s: calling csd_switch_device", __func__);
+        err = csd_switch_device(rx_dev_id, tx_dev_id);
+        if (err < 0) {
+            ALOGE("%s: csd_switch_device failed, error %d", __func__, err);
+        }
+    }
+
+    adev_set_voice_volume(&adev->hw_device, adev->voice_volume);
+
+    /* Restart pcm only if switching off or onto bt to adjust to amr */
+    if(old_rx_dev == DEVICE_BT_SCO_RX_ACDB_ID || rx_dev_id == DEVICE_BT_SCO_RX_ACDB_ID){
+        ALOGI("%s: old_rx_dev: %i", __func__, old_rx_dev);
+        end_call(adev);
+        start_call(adev);
+    }
+
+    old_rx_dev = rx_dev_id;
 }
 
 static void set_input_volumes(struct m0_audio_device *adev, int main_mic_on,
@@ -502,6 +639,8 @@ static void force_all_standby(struct m0_audio_device *adev)
 
 static void select_mode(struct m0_audio_device *adev)
 {
+    int err;
+
     if (adev->mode == AUDIO_MODE_IN_CALL) {
         ALOGE("Entering IN_CALL state, in_call=%d", adev->in_call);
         if (!adev->in_call) {
@@ -523,8 +662,6 @@ static void select_mode(struct m0_audio_device *adev)
                 adev->out_device &= ~AUDIO_DEVICE_OUT_SPEAKER;
             select_output_device(adev);
             start_call(adev);
-            ril_set_call_clock_sync(&adev->ril, SOUND_CLOCK_START);
-            adev_set_voice_volume(&adev->hw_device, adev->voice_volume);
             adev->in_call = 1;
         }
     } else {
@@ -533,20 +670,20 @@ static void select_mode(struct m0_audio_device *adev)
         if (adev->in_call) {
             adev->in_call = 0;
             end_call(adev);
+
+            /* QCOM CSD-Client */
+            if (csd_stop_voice == NULL) {
+                ALOGE("dlsym:Error:%s Loading csd_client_disable_device", dlerror());
+            } else {
+                ALOGD("%s: calling csd_stop_voice", __func__);
+                err = csd_stop_voice(1);
+                if (err < 0) {
+                    ALOGE("%s: csd_stop_voice error %d\n", __func__, err);
+                }
+            }
+
             force_all_standby(adev);
-
-            ALOGD("%s: set voicecall route: voicecall_default_disable", __func__);
-            set_voicecall_route_by_array(adev->mixer, voicecall_default_disable, 1);
-            ALOGD("%s: set voicecall route: default_input_disable", __func__);
-            set_voicecall_route_by_array(adev->mixer, default_input_disable, 1);
-            ALOGD("%s: set voicecall route: headset_input_disable", __func__);
-            set_voicecall_route_by_array(adev->mixer, headset_input_disable, 1);
-            ALOGD("%s: set voicecall route: bt_disable", __func__);
-            set_voicecall_route_by_array(adev->mixer, bt_disable, 1);
-
             select_output_device(adev);
-            //Force Input Standby
-            adev->in_device = AUDIO_DEVICE_NONE;
             select_input_device(adev);
         }
     }
@@ -632,41 +769,45 @@ static void select_output_device(struct m0_audio_device *adev)
 
         if (headset_on || headphone_on || speaker_on || earpiece_on) {
             ALOGD("%s: set voicecall route: voicecall_default", __func__);
-            set_voicecall_route_by_array(adev->mixer, voicecall_default, 1);
+            set_bigroute_by_array(adev->mixer, voicecall_default, 1);
         } else {
             ALOGD("%s: set voicecall route: voicecall_default_disable", __func__);
-            set_voicecall_route_by_array(adev->mixer, voicecall_default_disable, 1);
+            set_bigroute_by_array(adev->mixer, voicecall_default_disable, 1);
         }
 
         if (speaker_on || earpiece_on || headphone_on) {
             ALOGD("%s: set voicecall route: default_input", __func__);
-            set_voicecall_route_by_array(adev->mixer, default_input, 1);
+            set_bigroute_by_array(adev->mixer, default_input, 1);
         } else {
             ALOGD("%s: set voicecall route: default_input_disable", __func__);
-            set_voicecall_route_by_array(adev->mixer, default_input_disable, 1);
+            set_bigroute_by_array(adev->mixer, default_input_disable, 1);
+        }
+
+        if (speaker_on) {
+            ALOGD("%s: set voicecall route: speaker_output", __func__);
+            set_bigroute_by_array(adev->mixer, speaker_output, 1);
+        } else {
+            ALOGD("%s: set voicecall route: speaker_output_disable", __func__);
+            set_bigroute_by_array(adev->mixer, speaker_output_disable, 1);
         }
 
         if (headset_on) {
             ALOGD("%s: set voicecall route: headset_input", __func__);
-            set_voicecall_route_by_array(adev->mixer, headset_input, 1);
+            set_bigroute_by_array(adev->mixer, headset_input, 1);
         } else {
             ALOGD("%s: set voicecall route: headset_input_disable", __func__);
-            set_voicecall_route_by_array(adev->mixer, headset_input_disable, 1);
+            set_bigroute_by_array(adev->mixer, headset_input_disable, 1);
         }
 
         if (bt_on) {
-            // bt uses a different port (PORT_BT) for playback, reopen the pcms
-            end_call(adev);
-            start_call(adev);
             ALOGD("%s: set voicecall route: bt_input", __func__);
-            set_voicecall_route_by_array(adev->mixer, bt_input, 1);
+            set_bigroute_by_array(adev->mixer, bt_input, 1);
             ALOGD("%s: set voicecall route: bt_output", __func__);
-            set_voicecall_route_by_array(adev->mixer, bt_output, 1);
+            set_bigroute_by_array(adev->mixer, bt_output, 1);
         } else {
             ALOGD("%s: set voicecall route: bt_disable", __func__);
-            set_voicecall_route_by_array(adev->mixer, bt_disable, 1);
+            set_bigroute_by_array(adev->mixer, bt_disable, 1);
         }
-
         set_incall_device(adev);
     }
 }
@@ -680,9 +821,9 @@ static void select_input_device(struct m0_audio_device *adev)
             ALOGD("%s: AUDIO_DEVICE_IN_BUILTIN_MIC", __func__);
             break;
         case AUDIO_DEVICE_IN_BACK_MIC:
-            ALOGD("%s: AUDIO_DEVICE_IN_BACK_MIC | AUDIO_DEVICE_IN_BUILTIN_MIC", __func__);
             // Force use both mics for video recording
             adev->in_device = (AUDIO_DEVICE_IN_BACK_MIC | AUDIO_DEVICE_IN_BUILTIN_MIC) & ~AUDIO_DEVICE_BIT_IN;
+            ALOGD("%s: AUDIO_DEVICE_IN_BACK_MIC and AUDIO_DEVICE_IN_BUILTIN_MIC", __func__);
             break;
         case AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET:
             ALOGD("%s: AUDIO_DEVICE_IN_BLUETOOTH_SCO_HEADSET", __func__);
@@ -2538,18 +2679,33 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
             adev->screen_off = true;
     }
 
+    // Wideband AMR
+    ret = str_parms_get_str(parms, "wb_amr", value, sizeof(value));
+    if (ret >= 0) {
+        if (csd_wide_voice == NULL) {
+                ALOGE("dlsym: Error:%s Loading csd_wide_voice", dlerror());
+        } else {
+            if (strcmp(value, "on") == 0) {
+                ALOGE("%s: enabling csd_wide_voice", __func__);
+                csd_wide_voice(VX_WB_SAMPLING_RATE);
+            } else {
+                ALOGE("%s: disabling csd_wide_voice", __func__);
+                csd_wide_voice(VX_NB_SAMPLING_RATE);
+            }
+        }
+    }
+
+    // FIXME
     ret = str_parms_get_str(parms, "noise_suppression", value, sizeof(value));
     if (ret >= 0) {
         if (strcmp(value, "true") == 0) {
             ALOGE("%s: enabling two mic control", __func__);
-            ril_set_two_mic_control(&adev->ril, AUDIENCE, TWO_MIC_SOLUTION_ON);
             /* sub mic */
-            set_voicecall_route_by_array(adev->mixer, noise_suppression, 1);
+            set_bigroute_by_array(adev->mixer, noise_suppression, 1);
         } else {
             ALOGE("%s: disabling two mic control", __func__);
-            ril_set_two_mic_control(&adev->ril, AUDIENCE, TWO_MIC_SOLUTION_OFF);
             /* sub mic */
-            set_voicecall_route_by_array(adev->mixer, noise_suppression_disable, 1);
+            set_bigroute_by_array(adev->mixer, noise_suppression_disable, 1);
         }
     }
 
@@ -2574,9 +2730,17 @@ static int adev_set_voice_volume(struct audio_hw_device *dev, float volume)
 
     adev->voice_volume = volume;
 
-    if (adev->mode == AUDIO_MODE_IN_CALL)
-        ril_set_call_volume(&adev->ril, SOUND_TYPE_VOICE, volume);
+    ALOGD("%s: Voice Index: %i", __func__, voice_index);
 
+    if (adev->mode == AUDIO_MODE_IN_CALL) {
+        if (csd_volume_index == NULL) {
+            ALOGE("dlsym: Error:%s Loading csd_volume_index", dlerror());
+        } else {
+            volume = volume * voice_index;
+            ALOGD("%s: calling csd_volume_index(%f)", __func__, volume);
+            csd_volume_index(volume);
+        }
+    }
     return 0;
 }
 
@@ -2604,6 +2768,15 @@ static int adev_set_mic_mute(struct audio_hw_device *dev, bool state)
     struct m0_audio_device *adev = (struct m0_audio_device *)dev;
 
     adev->mic_mute = state;
+
+    if (adev->mode == AUDIO_MODE_IN_CALL) {
+        if (csd_mic_mute == NULL) {
+            ALOGE("dlsym: Error:%s Loading csd_mic_mute", dlerror());
+        } else {
+            ALOGD("%s: calling csd_mic_mute, state=%d", __func__, adev->mic_mute);
+            csd_mic_mute(adev->mic_mute);
+        }
+    }
 
     return 0;
 }
@@ -2748,8 +2921,17 @@ static int adev_close(hw_device_t *device)
 {
     struct m0_audio_device *adev = (struct m0_audio_device *)device;
 
-    /* RIL */
-    ril_close(&adev->ril);
+    /* QCOM CSD-Client */
+    if (mCsdHandle) {
+        if (csd_client_deinit == NULL) {
+            ALOGE("dlsym: Error:%s Loading csd_client_deinit", dlerror());
+        } else {
+            ALOGD("%s: calling csd_client_deinit", __func__);
+            csd_client_deinit();
+        }
+        dlclose(mCsdHandle);
+        mCsdHandle = NULL;
+     }
 
     mixer_close(adev->mixer);
     free(device);
@@ -2772,8 +2954,8 @@ static const struct {
     { AUDIO_DEVICE_OUT_SPEAKER, "speaker" },
     { AUDIO_DEVICE_OUT_WIRED_HEADSET | AUDIO_DEVICE_OUT_WIRED_HEADPHONE, "headphone" },
     { AUDIO_DEVICE_OUT_EARPIECE, "earpiece" },
-    { AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET, "dock" },
-    { AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET, "dock" },
+    { AUDIO_DEVICE_OUT_ANLG_DOCK_HEADSET, "analogue-dock" },
+    { AUDIO_DEVICE_OUT_DGTL_DOCK_HEADSET, "digital-dock" },
     { AUDIO_DEVICE_OUT_ALL_SCO, "sco-out" },
     { AUDIO_DEVICE_OUT_AUX_DIGITAL, "aux-digital" },
 
@@ -2793,85 +2975,86 @@ static void adev_config_start(void *data, const XML_Char *elem,
     unsigned int i, j;
 
     for (i = 0; attr[i]; i += 2) {
-        if (strcmp(attr[i], "name") == 0)
-            name = attr[i + 1];
+    if (strcmp(attr[i], "name") == 0)
+        name = attr[i + 1];
 
-        if (strcmp(attr[i], "val") == 0)
-            val = attr[i + 1];
+    if (strcmp(attr[i], "val") == 0)
+        val = attr[i + 1];
     }
 
     if (strcmp(elem, "device") == 0) {
-        if (!name) {
-            ALOGE("Unnamed device\n");
+    if (!name) {
+        ALOGE("Unnamed device\n");
+        return;
+    }
+
+    for (i = 0; i < sizeof(dev_names) / sizeof(dev_names[0]); i++) {
+        if (strcmp(dev_names[i].name, name) == 0) {
+        ALOGI("Allocating device %s\n", name);
+        dev_cfg = realloc(s->adev->dev_cfgs,
+                  (s->adev->num_dev_cfgs + 1)
+                  * sizeof(*dev_cfg));
+        if (!dev_cfg) {
+            ALOGE("Unable to allocate dev_cfg\n");
             return;
         }
 
-        for (i = 0; i < sizeof(dev_names) / sizeof(dev_names[0]); i++) {
-            if (strcmp(dev_names[i].name, name) == 0) {
-            ALOGI("Allocating device %s\n", name);
-            dev_cfg = realloc(s->adev->dev_cfgs,
-                      (s->adev->num_dev_cfgs + 1)
-                      * sizeof(*dev_cfg));
-            if (!dev_cfg) {
-                ALOGE("Unable to allocate dev_cfg\n");
-                return;
-            }
+        s->dev = &dev_cfg[s->adev->num_dev_cfgs];
+        memset(s->dev, 0, sizeof(*s->dev));
+        s->dev->mask = dev_names[i].mask;
 
-            s->dev = &dev_cfg[s->adev->num_dev_cfgs];
-            memset(s->dev, 0, sizeof(*s->dev));
-            s->dev->mask = dev_names[i].mask;
-
-            s->adev->dev_cfgs = dev_cfg;
-            s->adev->num_dev_cfgs++;
-            }
+        s->adev->dev_cfgs = dev_cfg;
+        s->adev->num_dev_cfgs++;
         }
+    }
+
     } else if (strcmp(elem, "path") == 0) {
-        if (s->path_len)
-            ALOGW("Nested paths\n");
+    if (s->path_len)
+        ALOGW("Nested paths\n");
 
-        /* If this a path for a device it must have a role */
-        if (s->dev) {
-            /* Need to refactor a bit... */
-            if (strcmp(name, "on") == 0) {
-            s->on = true;
-            } else if (strcmp(name, "off") == 0) {
-            s->on = false;
-            } else {
-            ALOGW("Unknown path name %s\n", name);
-            }
+    /* If this a path for a device it must have a role */
+    if (s->dev) {
+        /* Need to refactor a bit... */
+        if (strcmp(name, "on") == 0) {
+        s->on = true;
+        } else if (strcmp(name, "off") == 0) {
+        s->on = false;
+        } else {
+        ALOGW("Unknown path name %s\n", name);
         }
+    }
 
     } else if (strcmp(elem, "ctl") == 0) {
-        struct route_setting *r;
+    struct route_setting *r;
 
-        if (!name) {
-            ALOGE("Unnamed control\n");
-            return;
-        }
+    if (!name) {
+        ALOGE("Unnamed control\n");
+        return;
+    }
 
-        if (!val) {
-            ALOGE("No value specified for %s\n", name);
-            return;
-        }
+    if (!val) {
+        ALOGE("No value specified for %s\n", name);
+        return;
+    }
 
-        ALOGV("Parsing control %s => %s\n", name, val);
+    ALOGV("Parsing control %s => %s\n", name, val);
 
-        r = realloc(s->path, sizeof(*r) * (s->path_len + 1));
-        if (!r) {
-            ALOGE("Out of memory handling %s => %s\n", name, val);
-            return;
-        }
+    r = realloc(s->path, sizeof(*r) * (s->path_len + 1));
+    if (!r) {
+        ALOGE("Out of memory handling %s => %s\n", name, val);
+        return;
+    }
 
-        r[s->path_len].ctl_name = strdup(name);
-        r[s->path_len].strval = NULL;
+    r[s->path_len].ctl_name = strdup(name);
+    r[s->path_len].strval = NULL;
 
-        /* This can be fooled but it'll do */
-        r[s->path_len].intval = atoi(val);
-        if (!r[s->path_len].intval && strcmp(val, "0") != 0)
-            r[s->path_len].strval = strdup(val);
+    /* This can be fooled but it'll do */
+    r[s->path_len].intval = atoi(val);
+    if (!r[s->path_len].intval && strcmp(val, "0") != 0)
+        r[s->path_len].strval = strdup(val);
 
-        s->path = r;
-        s->path_len++;
+    s->path = r;
+    s->path_len++;
     }
 }
 
@@ -3020,6 +3203,10 @@ static int adev_open(const hw_module_t* module, const char* name,
         return -EINVAL;
     }
 
+    /* +30db boost for mics */
+    adev->mixer_ctls.mixinl_in1l_volume = mixer_get_ctl_by_name(adev->mixer, "MIXINL IN1L Volume");
+    adev->mixer_ctls.mixinl_in2l_volume = mixer_get_ctl_by_name(adev->mixer, "MIXINL IN2L Volume");
+
     ret = adev_config_parse(adev);
     if (ret != 0)
         goto err_mixer;
@@ -3028,25 +3215,34 @@ static int adev_open(const hw_module_t* module, const char* name,
     pthread_mutex_lock(&adev->lock);
     adev->mode = AUDIO_MODE_NORMAL;
     adev->out_device = AUDIO_DEVICE_OUT_SPEAKER;
-    adev->in_device = AUDIO_DEVICE_NONE;
+    adev->in_device = AUDIO_DEVICE_IN_BUILTIN_MIC & ~AUDIO_DEVICE_BIT_IN;
     select_devices(adev);
-
-    /* +30db boost for mics */
-    adev->mixer_ctls.mixinl_in1l_volume = mixer_get_ctl_by_name(adev->mixer, "MIXINL IN1L Volume");
-    adev->mixer_ctls.mixinl_in2l_volume = mixer_get_ctl_by_name(adev->mixer, "MIXINL IN2L Volume");
 
     adev->pcm_modem_dl = NULL;
     adev->pcm_modem_ul = NULL;
+    adev->pcm_bt_dl = NULL;
+    adev->pcm_bt_ul = NULL;
     adev->voice_volume = 1.0f;
     adev->tty_mode = TTY_MODE_OFF;
     adev->bluetooth_nrec = true;
-    adev->wb_amr = 0;
 
-    /* RIL */
-    ril_open(&adev->ril);
+    /* QCOM CSD-Client */
+    mCsdHandle = dlopen(CSD_CLIENT_LIBPATH, RTLD_NOW);
+    if (mCsdHandle == NULL) {
+        ALOGE("DLOPEN not successful for CSD CLIENT");
+    } else {
+        ALOGD("DLOPEN successful for CSD CLIENT");
+        setCsdHandle(mCsdHandle);
+        
+        if (csd_client_init == NULL) {
+            ALOGE("dlsym: Error:%s Loading csd_client_init", dlerror());
+        } else {
+            ALOGD("%s: calling csd_client_init", __func__);
+            csd_client_init();
+        }
+    }
+
     pthread_mutex_unlock(&adev->lock);
-    /* register callback for wideband AMR setting */
-    ril_register_set_wb_amr_callback(audio_set_wb_amr_callback, (void *)adev);
 
     *device = &adev->hw_device.common;
 
@@ -3068,7 +3264,7 @@ struct audio_module HAL_MODULE_INFO_SYM = {
         .module_api_version = AUDIO_MODULE_API_VERSION_0_1,
         .hal_api_version = HARDWARE_HAL_API_VERSION,
         .id = AUDIO_HARDWARE_MODULE_ID,
-        .name = "M0 audio HW HAL",
+        .name = "M3 audio HW HAL",
         .author = "The CyanogenMod Project",
         .methods = &hal_module_methods,
     },
